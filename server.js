@@ -4,7 +4,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const app = express();
 
 /**
- * Rewrite redirects so everything stays inside proxy
+ * Rewrite redirects so user stays inside proxy
  */
 function rewriteLocation(proxyRes) {
   const loc = proxyRes.headers['location'];
@@ -16,11 +16,11 @@ function rewriteLocation(proxyRes) {
 }
 
 /**
- * Common proxy config
+ * Shared proxy config
  */
 function createConfig(target) {
   return {
-    target,
+    target: target,
     changeOrigin: true,
     ws: true,
     followRedirects: true,
@@ -30,25 +30,20 @@ function createConfig(target) {
       referer: target
     },
 
-    cookieDomainRewrite: { '*': '' },
-    cookiePathRewrite: { '*': '/' },
-
-    selfHandleResponse: false, // IMPORTANT: let browser handle JS
+    cookieDomainRewrite: {
+      '*': ''
+    },
+    cookiePathRewrite: {
+      '*': '/'
+    },
 
     onProxyReq: (proxyReq, req, res) => {
-      const host = proxyReq.getHeader('host');
-    
-      // If request is for geforce now, keep correct host
-      if (req.headers.host.includes('localhost')) {
-        proxyReq.setHeader('host', new URL(proxyReq.path, 'https://play.geforcenow.com').host);
-      }
-    
-      proxyReq.setHeader('origin', 'https://play.geforcenow.com');
-      proxyReq.setHeader('referer', 'https://play.geforcenow.com/');
-    }
+      proxyReq.setHeader('origin', target);
+      proxyReq.setHeader('referer', target);
+    },
 
     onProxyRes: (proxyRes, req, res) => {
-      // Remove frame blockers (not always enough)
+      // Remove frame protections (may or may not work)
       delete proxyRes.headers['x-frame-options'];
       delete proxyRes.headers['content-security-policy'];
 
@@ -58,17 +53,25 @@ function createConfig(target) {
 }
 
 /**
- * Main site
+ * MAIN SITE
  */
-app.use('/', createProxyMiddleware(createConfig('https://play.geforcenow.com')));
+app.use(
+  '/',
+  createProxyMiddleware(createConfig('https://play.geforcenow.com'))
+);
 
 /**
- * Login domain
+ * LOGIN ROUTE
  */
-app.use('/auth', createProxyMiddleware({
-  ...createConfig('https://login.nvidia.com'),
-  pathRewrite: { '^/auth': '' }
-}));
+app.use(
+  '/auth',
+  createProxyMiddleware({
+    ...createConfig('https://login.nvidia.com'),
+    pathRewrite: {
+      '^/auth': ''
+    }
+  })
+);
 
 app.listen(3000, () => {
   console.log('Running on http://localhost:3000');
