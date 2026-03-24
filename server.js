@@ -4,80 +4,64 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const app = express();
 
 /**
- * Helper to rewrite redirects so user stays inside proxy
+ * Rewrite redirects so everything stays inside proxy
  */
-function rewriteLocationHeader(proxyRes, req) {
-  const location = proxyRes.headers['location'];
-  if (!location) return;
+function rewriteLocation(proxyRes) {
+  const loc = proxyRes.headers['location'];
+  if (!loc) return;
 
-  // Rewrite NVIDIA login → /auth
-  if (location.includes('login.nvidia.com')) {
-    proxyRes.headers['location'] = location.replace(
-      'https://login.nvidia.com',
-      '/auth'
-    );
-  }
-
-  // Rewrite GeForce NOW → /
-  if (location.includes('play.geforcenow.com')) {
-    proxyRes.headers['location'] = location.replace(
-      'https://play.geforcenow.com',
-      '/'
-    );
-  }
+  proxyRes.headers['location'] = loc
+    .replace('https://play.geforcenow.com', '/')
+    .replace('https://login.nvidia.com', '/auth');
 }
 
 /**
- * MAIN SITE PROXY
+ * Common proxy config
  */
-app.use('/', createProxyMiddleware({
-  target: 'https://play.geforcenow.com',
-  changeOrigin: true,
-  ws: true, // important for streaming/websockets
-  followRedirects: true,
+function createConfig(target) {
+  return {
+    target,
+    changeOrigin: true,
+    ws: true,
+    followRedirects: true,
 
-  cookieDomainRewrite: {
-    '*': ''
-  },
-  cookiePathRewrite: {
-    '*': '/'
-  },
+    headers: {
+      origin: target,
+      referer: target
+    },
 
-  onProxyRes: (proxyRes, req, res) => {
-    // Remove frame blocking (may still not work, but worth trying)
-    delete proxyRes.headers['x-frame-options'];
-    delete proxyRes.headers['content-security-policy'];
+    cookieDomainRewrite: { '*': '' },
+    cookiePathRewrite: { '*': '/' },
 
-    rewriteLocationHeader(proxyRes, req);
-  }
-}));
+    selfHandleResponse: false, // IMPORTANT: let browser handle JS
+
+    onProxyReq: (proxyReq, req, res) => {
+      // Force correct origin headers
+      proxyReq.setHeader('origin', target);
+      proxyReq.setHeader('referer', target);
+    },
+
+    onProxyRes: (proxyRes, req, res) => {
+      // Remove frame blockers (not always enough)
+      delete proxyRes.headers['x-frame-options'];
+      delete proxyRes.headers['content-security-policy'];
+
+      rewriteLocation(proxyRes);
+    }
+  };
+}
 
 /**
- * LOGIN PROXY (VERY IMPORTANT)
+ * Main site
+ */
+app.use('/', createProxyMiddleware(createConfig('https://play.geforcenow.com')));
+
+/**
+ * Login domain
  */
 app.use('/auth', createProxyMiddleware({
-  target: 'https://login.nvidia.com',
-  changeOrigin: true,
-  ws: true,
-  followRedirects: true,
-
-  pathRewrite: {
-    '^/auth': ''
-  },
-
-  cookieDomainRewrite: {
-    '*': ''
-  },
-  cookiePathRewrite: {
-    '*': '/'
-  },
-
-  onProxyRes: (proxyRes, req, res) => {
-    delete proxyRes.headers['x-frame-options'];
-    delete proxyRes.headers['content-security-policy'];
-
-    rewriteLocationHeader(proxyRes, req);
-  }
+  ...createConfig('https://login.nvidia.com'),
+  pathRewrite: { '^/auth': '' }
 }));
 
 app.listen(3000, () => {
