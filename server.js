@@ -36,10 +36,16 @@ function createConfig(target) {
     selfHandleResponse: false, // IMPORTANT: let browser handle JS
 
     onProxyReq: (proxyReq, req, res) => {
-      // Force correct origin headers
-      proxyReq.setHeader('origin', target);
-      proxyReq.setHeader('referer', target);
-    },
+      const host = proxyReq.getHeader('host');
+    
+      // If request is for geforce now, keep correct host
+      if (req.headers.host.includes('localhost')) {
+        proxyReq.setHeader('host', new URL(proxyReq.path, 'https://play.geforcenow.com').host);
+      }
+    
+      proxyReq.setHeader('origin', 'https://play.geforcenow.com');
+      proxyReq.setHeader('referer', 'https://play.geforcenow.com/');
+    }
 
     onProxyRes: (proxyRes, req, res) => {
       // Remove frame blockers (not always enough)
