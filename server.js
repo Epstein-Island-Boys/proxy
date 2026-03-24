@@ -4,7 +4,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const app = express();
 
 app.use('/', createProxyMiddleware({
-  target: 'https://www.desmos.com',
+  target: 'https://www.google.com',
   changeOrigin: true,
   onProxyRes: (proxyRes) => {
     delete proxyRes.headers['x-frame-options'];
