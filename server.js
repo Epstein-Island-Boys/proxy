@@ -49,4 +49,8 @@ app.use('/', createProxyMiddleware({
 app.get('/health', (req, res) => res.send('TikTok proxy OK'));
 
 const PORT = process.env.PORT || 3000;
+<<<<<<< HEAD
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+=======
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+>>>>>>> f0b08bc235a2e76751bd79ef2ea52cd6fe4d6740
