@@ -112,7 +112,22 @@ function buildBodyRewriter(upstreamHost) {
       return responseBuffer; // binary — pass through untouched
     }
 
-    const body = responseBuffer.toString('utf8');
+    let body = responseBuffer.toString('utf8');
+
+    // ── Strip Subresource Integrity (SRI) attributes ──────────────────────────
+    // The proxy rewrites domain strings inside JS/CSS, which changes the file
+    // bytes and breaks any sha256/sha384/sha512 integrity hash baked into the
+    // HTML. The browser then blocks the script entirely → black screen.
+    // We must remove integrity + crossorigin attributes from <script> and <link>
+    // tags so the browser skips hash validation.
+    if (contentType.includes('text/html')) {
+      // Remove integrity="..." and integrity='...'
+      body = body.replace(/\s+integrity=(["'])sha\d+-[A-Za-z0-9+/=]+\1/g, '');
+      // crossorigin="anonymous" is only meaningful alongside integrity; strip it
+      // too so the browser doesn't send a CORS preflight for no reason.
+      body = body.replace(/\s+crossorigin=(["'])[^"']*\1/g, '');
+    }
+
     const rewritten = rewriteUpstreamUrl(body);
     return Buffer.from(rewritten, 'utf8');
   });
