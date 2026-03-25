@@ -1,64 +1,43 @@
 'use strict';
 
 /**
- * PERFORMANCE ARCHITECTURE
+ * STREAMING PROXY ARCHITECTURE
  * ─────────────────────────────────────────────────────────────────────────────
- * selfHandleResponse:true + responseInterceptor buffers the ENTIRE response
- * before sending a single byte to the browser.  For large JS bundles this
- * means the user waits for the full download twice (proxy←upstream, then
- * browser←proxy).
+ * Previous versions used responseInterceptor which buffers the ENTIRE response
+ * before sending byte 1 to the browser. A 3MB JS bundle = browser waits for
+ * the full upstream download before anything renders.
  *
- * Instead we use TWO middleware layers per route:
+ * This version uses a custom onProxyRes with selfHandleResponse:true and
+ * splits into three pipelines based on content-type:
  *
- *   1. STREAMING proxy  (selfHandleResponse:false)
- *      – Handles every request.
- *      – onProxyReq  → rewrites request headers.
- *      – onProxyRes  → strips/rewrites response headers in-place.
- *      – For binary/non-text responses (images, fonts, wasm, video) the
- *        response body is piped directly to the browser.  Zero buffering.
- *      – For text responses it calls res.proxyNeedsRewrite = true and then
- *        falls through to layer 2 by NOT calling next() but also NOT writing
- *        the body — instead it stores the raw stream on res.upstreamStream.
+ *   BINARY  (images/fonts/wasm/video)
+ *     proxyRes ──────────────────────────────────────► res
+ *     Zero buffering. First byte arrives at browser immediately.
  *
- * Actually the cleanest split is: use selfHandleResponse:true ONLY for the
- * HTML document request (path === '/' or ends in .html), and use
- * selfHandleResponse:false for everything else.
+ *   TEXT/JS/CSS/JSON
+ *     proxyRes ──► decompress ──► RewriteTransform ──► res
+ *     Streaming domain rewrite. First byte arrives after one chunk (~64KB).
+ *     Handles chunk-boundary splits with an overlap buffer.
  *
- * We achieve this with two separate proxy middleware instances mounted on
- * the same path with a router that inspects Accept header / path extension.
+ *   HTML  (small, needs SRI stripping + SW snippet injection)
+ *     proxyRes ──► decompress ──► buffer ──► stripSRI+inject ──► res
+ *     Buffered but HTML is ~50KB so this is fast.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * SIMPLER CORRECT APPROACH (used here):
- *
- * Use ONE proxy with selfHandleResponse:true BUT inside responseInterceptor:
- *   – If content-type is NOT rewritable → return responseBuffer immediately
- *     (responseInterceptor still buffers it, but we return synchronously).
- *   – If content-type IS rewritable → do the string replacements.
- *
- * To make this fast:
- *   1. Re-enable Accept-Encoding to upstream so CDN sends gzip/br.
- *      responseInterceptor decompresses automatically.
- *   2. Add the `compression` npm package so the proxy re-gzips to browser.
- *   3. Set proper Cache-Control so browsers cache assets locally.
- *   4. Add a filter function so the proxy skips selfHandleResponse for
- *      requests whose path clearly points to a binary asset.
- *
- * Run:  npm install compression
+ * npm install compression   ← required
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
 const express    = require('express');
 const compression = require('compression');
-const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const zlib       = require('zlib');
-const { pipeline, Readable } = require('stream');
+const { Transform } = require('stream');
 
 const app = express();
-
-// Gzip/br compress all proxy responses sent to the browser
 app.use(compression());
 
 // ─── Config ──────────────────────────────────────────────────────────────────
+
 const PROXY_HOST = (process.env.PROXY_HOST || 'http://localhost:3000').replace(/\/$/, '');
 
 const DOMAIN_MAP = {
@@ -68,6 +47,9 @@ const DOMAIN_MAP = {
   'https://assets.nvidiagrid.net':                      `${PROXY_HOST}/nvidiagrid`,
   'https://gfnjpstorageaccount.blob.core.windows.net':  `${PROXY_HOST}/gfnblob`,
 };
+
+// Longest upstream URL length — used for chunk-boundary overlap buffer
+const MAX_DOMAIN_LEN = Math.max(...Object.keys(DOMAIN_MAP).map(k => k.length));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -104,7 +86,6 @@ function stripSRI(html) {
   return html;
 }
 
-// Content-types that need string replacement (everything else streams through)
 const REWRITABLE = [
   'text/html','text/css',
   'application/javascript','application/x-javascript','text/javascript',
@@ -112,15 +93,124 @@ const REWRITABLE = [
   'text/plain','text/xml','application/xml',
 ];
 const isRewritable = (ct = '') => REWRITABLE.some(t => ct.includes(t));
+const isHTML       = (ct = '') => ct.includes('text/html');
 
-// File extensions that are definitely binary — skip ALL body processing
-const BINARY_EXT = /\.(png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|eot|otf|mp4|webm|wasm|pdf|zip)(\?.*)?$/i;
-const isBinaryPath = path => BINARY_EXT.test(path);
+// ─── Streaming domain-rewrite Transform ───────────────────────────────────────
+//
+// Rewrites domain strings on-the-fly as chunks flow through.
+// Maintains an overlap buffer of MAX_DOMAIN_LEN chars between chunks so a
+// domain name that straddles a chunk boundary is still rewritten correctly.
+//
+function createRewriteStream() {
+  let leftover = '';
+
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      const str  = leftover + chunk.toString('utf8');
+      leftover   = str.slice(-MAX_DOMAIN_LEN);   // hold back tail for next chunk
+      const safe = str.slice(0, str.length - MAX_DOMAIN_LEN);
+      cb(null, Buffer.from(rewriteUpstreamUrl(safe), 'utf8'));
+    },
+    flush(cb) {
+      cb(null, Buffer.from(rewriteUpstreamUrl(leftover), 'utf8'));
+    },
+  });
+}
+
+// ─── Decompressor factory ─────────────────────────────────────────────────────
+function createDecompressor(encoding) {
+  switch ((encoding || '').toLowerCase()) {
+    case 'gzip':    return zlib.createGunzip();
+    case 'br':      return zlib.createBrotliDecompress();
+    case 'deflate': return zlib.createInflate();
+    default:        return null;
+  }
+}
+
+// ─── Core response handler ────────────────────────────────────────────────────
+//
+// Called from onProxyRes.  With selfHandleResponse:true the library does NOT
+// pipe proxyRes → res; we are fully responsible for sending the response.
+//
+function handleProxyResponse(proxyRes, req, res) {
+  sanitizeHeaders(proxyRes.headers);
+
+  const ct       = proxyRes.headers['content-type'] || '';
+  const encoding = proxyRes.headers['content-encoding'];
+
+  // ── 1. BINARY — stream straight through, no touching ─────────────────────
+  if (!isRewritable(ct)) {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+    proxyRes.on('error', () => res.end());
+    return;
+  }
+
+  // For text responses we decompress ourselves, so tell the browser the body
+  // will be plain (compression() middleware will re-gzip it if accepted)
+  delete proxyRes.headers['content-encoding'];
+  delete proxyRes.headers['content-length'];   // length will change after rewrite
+
+  // ── 2. HTML — buffer (small), strip SRI, inject SW snippet ───────────────
+  if (isHTML(ct)) {
+    proxyRes.headers['clear-site-data'] = '"cache", "cookies", "storage"';
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+
+    const decompressor = createDecompressor(encoding);
+    const source = decompressor ? proxyRes.pipe(decompressor) : proxyRes;
+
+    const chunks = [];
+    source.on('data', c => chunks.push(c));
+    source.on('end', () => {
+      let body = Buffer.concat(chunks).toString('utf8');
+      body = stripSRI(body);
+
+      // Inject SW unregister snippet immediately after <head>
+      const snippet = `<script>
+/* proxy */
+(function(){
+  if(!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.getRegistrations().then(function(r){r.forEach(function(s){s.unregister();});});
+  caches.keys().then(function(k){k.forEach(function(c){caches.delete(c);});});
+}());
+</script>`;
+      if (!body.includes('/* proxy */')) {
+        const patched = body.replace(/(<head[^>]*>)/i, '$1' + snippet);
+        body = patched.includes('/* proxy */') ? patched : snippet + body;
+      }
+
+      body = rewriteUpstreamUrl(body);
+      res.end(Buffer.from(body, 'utf8'));
+    });
+    source.on('error', err => {
+      console.error('[proxy] html decompress error:', err.message);
+      if (!res.writableEnded) res.end();
+    });
+    return;
+  }
+
+  // ── 3. JS / CSS / JSON — streaming rewrite, first byte ASAP ─────────────
+  res.writeHead(proxyRes.statusCode, proxyRes.headers);
+
+  const decompressor  = createDecompressor(encoding);
+  const rewriteStream = createRewriteStream();
+  const source        = decompressor ? proxyRes.pipe(decompressor) : proxyRes;
+
+  source.pipe(rewriteStream).pipe(res);
+
+  source.on('error', err => {
+    console.error('[proxy] js/css decompress error:', err.message);
+    if (!res.writableEnded) res.end();
+  });
+  rewriteStream.on('error', err => {
+    console.error('[proxy] rewrite stream error:', err.message);
+    if (!res.writableEnded) res.end();
+  });
+}
 
 // ─── Service-worker stub ──────────────────────────────────────────────────────
 
 const SW_STUB = `
-/* Proxy-injected stub — replaces gfn-service-worker.js */
 self.addEventListener('install', () => { self.skipWaiting(); });
 self.addEventListener('activate', async () => {
   const keys = await caches.keys();
@@ -131,7 +221,7 @@ self.addEventListener('activate', async () => {
 self.addEventListener('fetch', e => e.respondWith(fetch(e.request)));
 `;
 
-// Must be before ALL proxy middleware
+// Must be registered before ANY proxy middleware
 app.get(/gfn-service-worker\.js(\?.*)?$/, (_req, res) => {
   res.setHeader('Content-Type',           'application/javascript; charset=utf-8');
   res.setHeader('Service-Worker-Allowed', '/');
@@ -139,57 +229,8 @@ app.get(/gfn-service-worker\.js(\?.*)?$/, (_req, res) => {
   res.send(SW_STUB);
 });
 
-const SW_SNIPPET = `<script>
-(function(){
-  if(!('serviceWorker' in navigator)) return;
-  navigator.serviceWorker.getRegistrations().then(function(r){r.forEach(function(s){s.unregister();});});
-  caches.keys().then(function(k){k.forEach(function(c){caches.delete(c);});});
-}());
-</script>`;
-
-// ─── Response-body rewriter ───────────────────────────────────────────────────
-//
-// KEY PERFORMANCE CHANGE:
-//   • We re-allow Accept-Encoding to the upstream.  responseInterceptor
-//     decompresses gzip/br automatically, so we still get plain text to
-//     work with, but the upstream→proxy leg uses compression (faster on
-//     Render's outbound bandwidth).
-//   • For binary paths we skip selfHandleResponse entirely via the `filter`
-//     option so those responses are piped straight through without any
-//     buffering at all.
-//
-const bodyRewriter = responseInterceptor(
-  async (responseBuffer, proxyRes, req, _res) => {
-    sanitizeHeaders(proxyRes.headers);
-
-    const ct = proxyRes.headers['content-type'] || '';
-
-    // Binary or non-rewritable → return immediately, no string work
-    if (!isRewritable(ct)) return responseBuffer;
-
-    let body = responseBuffer.toString('utf8');
-
-    if (ct.includes('text/html')) {
-      body = stripSRI(body);
-
-      if (!body.includes('proxy: sw-unregister')) {
-        body = body.replace(/(<head[^>]*>)/i, '$1' + SW_SNIPPET);
-        if (!body.includes('proxy: sw-unregister'))
-          body = SW_SNIPPET + body;
-      }
-
-      // Nuke any SW + cache from prior visits
-      proxyRes.headers['clear-site-data'] = '"cache", "cookies", "storage"';
-    }
-
-    // Allow downstream compression (set by app.use(compression()) above)
-    delete proxyRes.headers['content-encoding'];
-
-    return Buffer.from(rewriteUpstreamUrl(body), 'utf8');
-  }
-);
-
 // ─── Proxy factory ────────────────────────────────────────────────────────────
+
 function makeProxy(target, { pathRewrite } = {}) {
   const { host } = new URL(target);
 
@@ -198,32 +239,21 @@ function makeProxy(target, { pathRewrite } = {}) {
     changeOrigin:        true,
     ws:                  true,
     followRedirects:     false,
-    selfHandleResponse:  true,
+    selfHandleResponse:  true,           // we pipe the response manually above
     cookieDomainRewrite: { '*': '' },
     cookiePathRewrite:   { '*': '/' },
     ...(pathRewrite ? { pathRewrite } : {}),
 
-    // Skip buffering entirely for known-binary paths
-    // (filter returning false means "don't proxy this request via this
-    //  middleware", but since we only use it for the skip-selfHandle trick
-    //  we instead rely on the early-return in bodyRewriter for content-type
-    //  checks, and use filter just to log)
-    // Note: to truly skip selfHandleResponse per-request we'd need two
-    // middleware instances; the early-return in responseInterceptor is the
-    // next best thing and avoids the string-replace overhead at least.
-
-    // ── v2-compatible flat event keys ──────────────────────────────────────
     onProxyReq(proxyReq, req) {
       proxyReq.setHeader('host',    host);
       proxyReq.setHeader('origin',  target);
       proxyReq.setHeader('referer', target + '/');
-      // Do NOT remove accept-encoding — let CDN send compressed responses.
-      // responseInterceptor handles decompression automatically.
+      // Keep accept-encoding — CDN sends compressed, we decompress ourselves
       const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
       if (ip) proxyReq.setHeader('x-forwarded-for', ip);
     },
 
-    onProxyRes: bodyRewriter,
+    onProxyRes: handleProxyResponse,
 
     onError(err, req, res) {
       console.error(`[proxy:error] ${req.method} ${req.url}`, err.message);
@@ -233,18 +263,21 @@ function makeProxy(target, { pathRewrite } = {}) {
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+
 app.use('/auth',       makeProxy('https://login.nvidia.com',     { pathRewrite: { '^/auth': '' } }));
 app.use('/nvidia',     makeProxy('https://www.nvidia.com',       { pathRewrite: { '^/nvidia': '' } }));
 app.use('/nvidiagrid', makeProxy('https://assets.nvidiagrid.net',{ pathRewrite: { '^/nvidiagrid': '' } }));
-app.use('/gfnblob',    makeProxy('https://gfnjpstorageaccount.blob.core.windows.net', { pathRewrite: { '^/gfnblob': '' } }));
+app.use('/gfnblob',    makeProxy('https://gfnjpstorageaccount.blob.core.windows.net',
+                         { pathRewrite: { '^/gfnblob': '' } }));
 app.use('/',           makeProxy('https://play.geforcenow.com'));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+
 const PORT   = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`[proxy] port=${PORT}  PROXY_HOST=${PROXY_HOST}`);
 });
 
-server.on('upgrade', (req) => console.log(`[ws:upgrade] ${req.url}`));
+server.on('upgrade', req => console.log(`[ws:upgrade] ${req.url}`));
 
 module.exports = { app, server };
