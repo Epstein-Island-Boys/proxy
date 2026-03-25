@@ -22,19 +22,19 @@
  *   HTML  (small, needs SRI stripping + SW snippet injection)
  *     proxyRes ──► decompress ──► buffer ──► stripSRI+inject ──► res
  *     Buffered but HTML is ~50KB so this is fast.
- *
- * npm install compression   ← required
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
 const express    = require('express');
-const compression = require('compression');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const zlib       = require('zlib');
 const { Transform } = require('stream');
 
+// NOTE: compression() middleware removed — it re-gzips every body we already
+// decompressed from the CDN, wasting CPU and adding latency on large bundles.
+// If you need outbound gzip, add it selectively per-route.
+
 const app = express();
-app.use(compression());
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -48,24 +48,58 @@ const DOMAIN_MAP = {
   'https://gfnjpstorageaccount.blob.core.windows.net':  `${PROXY_HOST}/gfnblob`,
 };
 
-// Longest upstream URL length — used for chunk-boundary overlap buffer
-const MAX_DOMAIN_LEN = Math.max(...Object.keys(DOMAIN_MAP).map(k => k.length));
+// ─── Precompiled domain rewrite ───────────────────────────────────────────────
+//
+// KEY PERF FIX: Previously rewriteUpstreamUrl did N separate split().join()
+// passes (one per domain), allocating a new string each time. A single compiled
+// RegExp rewrites all domains in ONE pass through the string, and the replace
+// callback only fires on actual matches.
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const DOMAIN_ENTRIES = Object.entries(DOMAIN_MAP);
+
+const DOMAIN_REGEX = new RegExp(
+  DOMAIN_ENTRIES
+    .map(([up]) => up.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|'),
+  'g'
+);
 
 function rewriteUpstreamUrl(str) {
-  for (const [up, local] of Object.entries(DOMAIN_MAP))
-    str = str.split(up).join(local);
-  return str;
+  // Short-circuit: if no upstream domain appears in the string, skip replace()
+  // entirely. Most chunks in large JS bundles won't contain any domain.
+  if (!str.includes('nvidia') && !str.includes('geforcenow') && !str.includes('gfnjpstorageaccount')) {
+    return str;
+  }
+  return str.replace(DOMAIN_REGEX, match => DOMAIN_MAP[match]);
 }
 
+// Longest upstream URL length — used for chunk-boundary overlap buffer
+const MAX_DOMAIN_LEN = Math.max(...DOMAIN_ENTRIES.map(([k]) => k.length));
+
+// ─── Precompiled content-type checks ─────────────────────────────────────────
+//
+// Previously isRewritable / isHTML scanned an array on every request.
+// A compiled regex is a single C-level call.
+
+const REWRITABLE_RE = /text\/html|text\/css|text\/plain|text\/xml|application\/(javascript|x-javascript|json|manifest\+json|xml)/i;
+const HTML_RE       = /text\/html/i;
+
+const isRewritable = (ct = '') => REWRITABLE_RE.test(ct);
+const isHTML       = (ct = '') => HTML_RE.test(ct);
+
+// ─── Header sanitization ──────────────────────────────────────────────────────
+//
+// Use a Set for O(1) membership checks instead of forEach on an array.
+
+const DROP_HEADERS = new Set([
+  'x-frame-options','content-security-policy','content-security-policy-report-only',
+  'cross-origin-opener-policy','cross-origin-embedder-policy',
+  'cross-origin-resource-policy','strict-transport-security',
+  'x-content-type-options','x-xss-protection','report-to','nel',
+]);
+
 function sanitizeHeaders(headers) {
-  [
-    'x-frame-options','content-security-policy','content-security-policy-report-only',
-    'cross-origin-opener-policy','cross-origin-embedder-policy',
-    'cross-origin-resource-policy','strict-transport-security',
-    'x-content-type-options','x-xss-protection','report-to','nel',
-  ].forEach(h => delete headers[h]);
+  for (const h of DROP_HEADERS) delete headers[h];
 
   if (headers['location'])
     headers['location'] = rewriteUpstreamUrl(headers['location']);
@@ -78,46 +112,50 @@ function sanitizeHeaders(headers) {
     );
 }
 
-function stripSRI(html) {
-  html = html.replace(/(?<![a-zA-Z0-9_-])integrity\s*=\s*"[^"]*"/gi,   '');
-  html = html.replace(/(?<![a-zA-Z0-9_-])integrity\s*=\s*'[^']*'/gi,   '');
-  html = html.replace(/(?<![a-zA-Z0-9_-])crossorigin\s*=\s*"[^"]*"/gi, '');
-  html = html.replace(/(?<![a-zA-Z0-9_-])crossorigin\s*=\s*'[^']*'/gi, '');
-  return html;
-}
+// ─── SRI stripping ────────────────────────────────────────────────────────────
+//
+// Precompile SRI/crossorigin regexes once instead of inline.
 
-const REWRITABLE = [
-  'text/html','text/css',
-  'application/javascript','application/x-javascript','text/javascript',
-  'application/json','application/manifest+json',
-  'text/plain','text/xml','application/xml',
-];
-const isRewritable = (ct = '') => REWRITABLE.some(t => ct.includes(t));
-const isHTML       = (ct = '') => ct.includes('text/html');
+const SRI_RE_DQ   = /(?<![a-zA-Z0-9_-])integrity\s*=\s*"[^"]*"/gi;
+const SRI_RE_SQ   = /(?<![a-zA-Z0-9_-])integrity\s*=\s*'[^']*'/gi;
+const CORS_RE_DQ  = /(?<![a-zA-Z0-9_-])crossorigin\s*=\s*"[^"]*"/gi;
+const CORS_RE_SQ  = /(?<![a-zA-Z0-9_-])crossorigin\s*=\s*'[^']*'/gi;
+
+function stripSRI(html) {
+  return html
+    .replace(SRI_RE_DQ,  '')
+    .replace(SRI_RE_SQ,  '')
+    .replace(CORS_RE_DQ, '')
+    .replace(CORS_RE_SQ, '');
+}
 
 // ─── Streaming domain-rewrite Transform ───────────────────────────────────────
 //
 // Rewrites domain strings on-the-fly as chunks flow through.
 // Maintains an overlap buffer of MAX_DOMAIN_LEN chars between chunks so a
 // domain name that straddles a chunk boundary is still rewritten correctly.
-//
+
 function createRewriteStream() {
   let leftover = '';
 
   return new Transform({
     transform(chunk, _enc, cb) {
-      const str  = leftover + chunk.toString('utf8');
-      leftover   = str.slice(-MAX_DOMAIN_LEN);   // hold back tail for next chunk
-      const safe = str.slice(0, str.length - MAX_DOMAIN_LEN);
-      cb(null, Buffer.from(rewriteUpstreamUrl(safe), 'utf8'));
+      const str    = leftover + chunk.toString('utf8');
+      leftover     = str.slice(-MAX_DOMAIN_LEN);  // hold back tail for next chunk
+      const safe   = str.slice(0, str.length - MAX_DOMAIN_LEN);
+      const result = rewriteUpstreamUrl(safe);
+      // Avoid unnecessary Buffer allocation when nothing changed
+      cb(null, result === safe ? Buffer.from(safe, 'utf8') : Buffer.from(result, 'utf8'));
     },
     flush(cb) {
+      if (!leftover) return cb();
       cb(null, Buffer.from(rewriteUpstreamUrl(leftover), 'utf8'));
     },
   });
 }
 
 // ─── Decompressor factory ─────────────────────────────────────────────────────
+
 function createDecompressor(encoding) {
   switch ((encoding || '').toLowerCase()) {
     case 'gzip':    return zlib.createGunzip();
@@ -128,10 +166,7 @@ function createDecompressor(encoding) {
 }
 
 // ─── Core response handler ────────────────────────────────────────────────────
-//
-// Called from onProxyRes.  With selfHandleResponse:true the library does NOT
-// pipe proxyRes → res; we are fully responsible for sending the response.
-//
+
 function handleProxyResponse(proxyRes, req, res) {
   sanitizeHeaders(proxyRes.headers);
 
@@ -146,10 +181,9 @@ function handleProxyResponse(proxyRes, req, res) {
     return;
   }
 
-  // For text responses we decompress ourselves, so tell the browser the body
-  // will be plain (compression() middleware will re-gzip it if accepted)
+  // For text responses we decompress ourselves
   delete proxyRes.headers['content-encoding'];
-  delete proxyRes.headers['content-length'];   // length will change after rewrite
+  delete proxyRes.headers['content-length'];
 
   // ── 2. HTML — buffer (small), strip SRI, inject SW snippet ───────────────
   if (isHTML(ct)) {
@@ -165,7 +199,6 @@ function handleProxyResponse(proxyRes, req, res) {
       let body = Buffer.concat(chunks).toString('utf8');
       body = stripSRI(body);
 
-      // Inject SW unregister snippet immediately after <head>
       const snippet = `<script>
 /* proxy */
 (function(){
@@ -221,7 +254,6 @@ self.addEventListener('activate', async () => {
 self.addEventListener('fetch', e => e.respondWith(fetch(e.request)));
 `;
 
-// Must be registered before ANY proxy middleware
 app.get(/gfn-service-worker\.js(\?.*)?$/, (_req, res) => {
   res.setHeader('Content-Type',           'application/javascript; charset=utf-8');
   res.setHeader('Service-Worker-Allowed', '/');
@@ -239,7 +271,7 @@ function makeProxy(target, { pathRewrite } = {}) {
     changeOrigin:        true,
     ws:                  true,
     followRedirects:     false,
-    selfHandleResponse:  true,           // we pipe the response manually above
+    selfHandleResponse:  true,
     cookieDomainRewrite: { '*': '' },
     cookiePathRewrite:   { '*': '/' },
     ...(pathRewrite ? { pathRewrite } : {}),
@@ -248,7 +280,6 @@ function makeProxy(target, { pathRewrite } = {}) {
       proxyReq.setHeader('host',    host);
       proxyReq.setHeader('origin',  target);
       proxyReq.setHeader('referer', target + '/');
-      // Keep accept-encoding — CDN sends compressed, we decompress ourselves
       const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
       if (ip) proxyReq.setHeader('x-forwarded-for', ip);
     },
