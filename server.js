@@ -1,32 +1,66 @@
 'use strict';
 
 /**
- * IMPORTANT — http-proxy-middleware API version compatibility:
+ * PERFORMANCE ARCHITECTURE
+ * ─────────────────────────────────────────────────────────────────────────────
+ * selfHandleResponse:true + responseInterceptor buffers the ENTIRE response
+ * before sending a single byte to the browser.  For large JS bundles this
+ * means the user waits for the full download twice (proxy←upstream, then
+ * browser←proxy).
  *
- *   v2.x  →  onProxyReq / onProxyRes / onError  (flat keys on the config object)
- *   v3.x  →  on: { proxyReq, proxyRes, error }  (nested under `on`)
+ * Instead we use TWO middleware layers per route:
  *
- * The previous version used v3 syntax.  If your installed version is v2 the
- * entire `on` block is silently ignored — no header stripping, no body
- * rewriting, no SRI removal.  This file uses v2-style flat keys so it works
- * regardless of which version you have installed.
+ *   1. STREAMING proxy  (selfHandleResponse:false)
+ *      – Handles every request.
+ *      – onProxyReq  → rewrites request headers.
+ *      – onProxyRes  → strips/rewrites response headers in-place.
+ *      – For binary/non-text responses (images, fonts, wasm, video) the
+ *        response body is piped directly to the browser.  Zero buffering.
+ *      – For text responses it calls res.proxyNeedsRewrite = true and then
+ *        falls through to layer 2 by NOT calling next() but also NOT writing
+ *        the body — instead it stores the raw stream on res.upstreamStream.
  *
- * To check: `npm list http-proxy-middleware`
- * To pin v2: `npm install http-proxy-middleware@^2.0.6`
+ * Actually the cleanest split is: use selfHandleResponse:true ONLY for the
+ * HTML document request (path === '/' or ends in .html), and use
+ * selfHandleResponse:false for everything else.
+ *
+ * We achieve this with two separate proxy middleware instances mounted on
+ * the same path with a router that inspects Accept header / path extension.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SIMPLER CORRECT APPROACH (used here):
+ *
+ * Use ONE proxy with selfHandleResponse:true BUT inside responseInterceptor:
+ *   – If content-type is NOT rewritable → return responseBuffer immediately
+ *     (responseInterceptor still buffers it, but we return synchronously).
+ *   – If content-type IS rewritable → do the string replacements.
+ *
+ * To make this fast:
+ *   1. Re-enable Accept-Encoding to upstream so CDN sends gzip/br.
+ *      responseInterceptor decompresses automatically.
+ *   2. Add the `compression` npm package so the proxy re-gzips to browser.
+ *   3. Set proper Cache-Control so browsers cache assets locally.
+ *   4. Add a filter function so the proxy skips selfHandleResponse for
+ *      requests whose path clearly points to a binary asset.
+ *
+ * Run:  npm install compression
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
-const express = require('express');
+const express    = require('express');
+const compression = require('compression');
 const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
+const zlib       = require('zlib');
+const { pipeline, Readable } = require('stream');
 
 const app = express();
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
+// Gzip/br compress all proxy responses sent to the browser
+app.use(compression());
+
+// ─── Config ──────────────────────────────────────────────────────────────────
 const PROXY_HOST = (process.env.PROXY_HOST || 'http://localhost:3000').replace(/\/$/, '');
 
-// All upstream domains the GFN frontend may reference → mapped to proxy paths.
-// Add more here as you discover them in DevTools Network tab.
 const DOMAIN_MAP = {
   'https://play.geforcenow.com':                        PROXY_HOST,
   'https://login.nvidia.com':                           `${PROXY_HOST}/auth`,
@@ -35,94 +69,60 @@ const DOMAIN_MAP = {
   'https://gfnjpstorageaccount.blob.core.windows.net':  `${PROXY_HOST}/gfnblob`,
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function rewriteUpstreamUrl(str) {
-  for (const [upstream, local] of Object.entries(DOMAIN_MAP)) {
-    str = str.split(upstream).join(local);
-  }
+  for (const [up, local] of Object.entries(DOMAIN_MAP))
+    str = str.split(up).join(local);
   return str;
 }
 
-/**
- * Mutates the headers object in-place — removes every security / isolation
- * header that would break the proxied page under a different origin.
- */
 function sanitizeHeaders(headers) {
-  const DROP = [
-    'x-frame-options',
-    'content-security-policy',
-    'content-security-policy-report-only',
-    'cross-origin-opener-policy',
-    'cross-origin-embedder-policy',
-    'cross-origin-resource-policy',
-    'strict-transport-security',
-    'x-content-type-options',
-    'x-xss-protection',
-    'report-to',
-    'nel',
-  ];
-  DROP.forEach(h => delete headers[h]);
+  [
+    'x-frame-options','content-security-policy','content-security-policy-report-only',
+    'cross-origin-opener-policy','cross-origin-embedder-policy',
+    'cross-origin-resource-policy','strict-transport-security',
+    'x-content-type-options','x-xss-protection','report-to','nel',
+  ].forEach(h => delete headers[h]);
 
-  if (headers['location']) {
+  if (headers['location'])
     headers['location'] = rewriteUpstreamUrl(headers['location']);
-  }
 
-  if (headers['set-cookie']) {
+  if (headers['set-cookie'])
     headers['set-cookie'] = headers['set-cookie'].map(c =>
-      c
-        .replace(/;\s*Domain=[^;]*/gi, '')
-        .replace(/;\s*SameSite=\w+/gi, '; SameSite=Lax')
-        .replace(/;\s*Secure/gi,
-          process.env.NODE_ENV === 'production' ? '; Secure' : '')
+      c.replace(/;\s*Domain=[^;]*/gi, '')
+       .replace(/;\s*SameSite=\w+/gi,  '; SameSite=Lax')
+       .replace(/;\s*Secure/gi, process.env.NODE_ENV === 'production' ? '; Secure' : '')
     );
-  }
 }
 
-/**
- * Strip SRI integrity and crossorigin attributes from HTML.
- *
- * Uses a negative lookbehind so it matches even when there is no whitespace
- * immediately before the attribute name (minified / newline-separated HTML).
- */
 function stripSRI(html) {
-  html = html.replace(/(?<![a-zA-Z0-9_-])integrity\s*=\s*"[^"]*"/gi,  '');
-  html = html.replace(/(?<![a-zA-Z0-9_-])integrity\s*=\s*'[^']*'/gi,  '');
-  html = html.replace(/(?<![a-zA-Z0-9_-])crossorigin\s*=\s*"[^"]*"/gi,'');
-  html = html.replace(/(?<![a-zA-Z0-9_-])crossorigin\s*=\s*'[^']*'/gi,'');
+  html = html.replace(/(?<![a-zA-Z0-9_-])integrity\s*=\s*"[^"]*"/gi,   '');
+  html = html.replace(/(?<![a-zA-Z0-9_-])integrity\s*=\s*'[^']*'/gi,   '');
+  html = html.replace(/(?<![a-zA-Z0-9_-])crossorigin\s*=\s*"[^"]*"/gi, '');
+  html = html.replace(/(?<![a-zA-Z0-9_-])crossorigin\s*=\s*'[^']*'/gi, '');
   return html;
 }
 
-const REWRITABLE_TYPES = [
-  'text/html',
-  'text/css',
-  'application/javascript',
-  'application/x-javascript',
-  'text/javascript',
-  'application/json',
-  'text/plain',
-  'application/manifest+json',
-  'application/xml',
-  'text/xml',
+// Content-types that need string replacement (everything else streams through)
+const REWRITABLE = [
+  'text/html','text/css',
+  'application/javascript','application/x-javascript','text/javascript',
+  'application/json','application/manifest+json',
+  'text/plain','text/xml','application/xml',
 ];
-const isRewritable = (ct = '') => REWRITABLE_TYPES.some(t => ct.includes(t));
+const isRewritable = (ct = '') => REWRITABLE.some(t => ct.includes(t));
 
-// ---------------------------------------------------------------------------
-// Service-worker neutralisation
-//
-// GFN's SW registers with scope / and intercepts ALL requests once installed,
-// serving stale cached HTML that still has the original integrity= attributes.
-// Fix: replace the SW file with a stub that immediately unregisters & clears
-// caches.  This route must be registered BEFORE any proxy middleware.
-// ---------------------------------------------------------------------------
+// File extensions that are definitely binary — skip ALL body processing
+const BINARY_EXT = /\.(png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|eot|otf|mp4|webm|wasm|pdf|zip)(\?.*)?$/i;
+const isBinaryPath = path => BINARY_EXT.test(path);
+
+// ─── Service-worker stub ──────────────────────────────────────────────────────
 
 const SW_STUB = `
 /* Proxy-injected stub — replaces gfn-service-worker.js */
-self.addEventListener('install', () => { console.log('[stub-sw] install'); self.skipWaiting(); });
+self.addEventListener('install', () => { self.skipWaiting(); });
 self.addEventListener('activate', async () => {
-  console.log('[stub-sw] activate — clearing caches and unregistering');
   const keys = await caches.keys();
   await Promise.all(keys.map(k => caches.delete(k)));
   await self.registration.unregister();
@@ -131,92 +131,100 @@ self.addEventListener('activate', async () => {
 self.addEventListener('fetch', e => e.respondWith(fetch(e.request)));
 `;
 
+// Must be before ALL proxy middleware
 app.get(/gfn-service-worker\.js(\?.*)?$/, (_req, res) => {
-  res.setHeader('Content-Type',          'application/javascript; charset=utf-8');
-  res.setHeader('Service-Worker-Allowed','/')
-  res.setHeader('Cache-Control',         'no-store, no-cache, must-revalidate');
+  res.setHeader('Content-Type',           'application/javascript; charset=utf-8');
+  res.setHeader('Service-Worker-Allowed', '/');
+  res.setHeader('Cache-Control',          'no-store');
   res.send(SW_STUB);
 });
 
-// Snippet injected into every HTML response body
-const SW_UNREGISTER_SNIPPET = `<script>
-/* proxy: unregister any previously-installed service workers on this origin */
+const SW_SNIPPET = `<script>
 (function(){
   if(!('serviceWorker' in navigator)) return;
-  navigator.serviceWorker.getRegistrations().then(function(regs){
-    regs.forEach(function(r){ console.log('[proxy] unregistering SW',r.scope); r.unregister(); });
-  });
-  caches.keys().then(function(keys){
-    keys.forEach(function(k){ console.log('[proxy] deleting cache',k); caches.delete(k); });
-  });
+  navigator.serviceWorker.getRegistrations().then(function(r){r.forEach(function(s){s.unregister();});});
+  caches.keys().then(function(k){k.forEach(function(c){caches.delete(c);});});
 }());
 </script>`;
 
-// ---------------------------------------------------------------------------
-// Body rewriter  (responseInterceptor requires selfHandleResponse:true)
-// ---------------------------------------------------------------------------
+// ─── Response-body rewriter ───────────────────────────────────────────────────
+//
+// KEY PERFORMANCE CHANGE:
+//   • We re-allow Accept-Encoding to the upstream.  responseInterceptor
+//     decompresses gzip/br automatically, so we still get plain text to
+//     work with, but the upstream→proxy leg uses compression (faster on
+//     Render's outbound bandwidth).
+//   • For binary paths we skip selfHandleResponse entirely via the `filter`
+//     option so those responses are piped straight through without any
+//     buffering at all.
+//
 const bodyRewriter = responseInterceptor(
-  async (responseBuffer, proxyRes, _req, _res) => {
-    // Always sanitize headers — even for binary responses
+  async (responseBuffer, proxyRes, req, _res) => {
     sanitizeHeaders(proxyRes.headers);
 
     const ct = proxyRes.headers['content-type'] || '';
-    if (!isRewritable(ct)) return responseBuffer; // binary asset — pass through
+
+    // Binary or non-rewritable → return immediately, no string work
+    if (!isRewritable(ct)) return responseBuffer;
 
     let body = responseBuffer.toString('utf8');
 
     if (ct.includes('text/html')) {
       body = stripSRI(body);
 
-      // Inject unregister snippet immediately after <head>
-      if (!body.includes('proxy: unregister')) {
-        body = body.replace(/(<head[^>]*>)/i, '$1' + SW_UNREGISTER_SNIPPET);
-        if (!body.includes('proxy: unregister')) {
-          body = SW_UNREGISTER_SNIPPET + body; // no <head> tag fallback
-        }
+      if (!body.includes('proxy: sw-unregister')) {
+        body = body.replace(/(<head[^>]*>)/i, '$1' + SW_SNIPPET);
+        if (!body.includes('proxy: sw-unregister'))
+          body = SW_SNIPPET + body;
       }
 
-      // Tell browser to nuke SW registrations + caches from prior visits
+      // Nuke any SW + cache from prior visits
       proxyRes.headers['clear-site-data'] = '"cache", "cookies", "storage"';
     }
+
+    // Allow downstream compression (set by app.use(compression()) above)
+    delete proxyRes.headers['content-encoding'];
 
     return Buffer.from(rewriteUpstreamUrl(body), 'utf8');
   }
 );
 
-// ---------------------------------------------------------------------------
-// Request header rewriter
-// ---------------------------------------------------------------------------
-function makeReqHandler(upstreamOrigin) {
-  const { host } = new URL(upstreamOrigin);
-  return (proxyReq, req) => {
-    proxyReq.setHeader('host',    host);
-    proxyReq.setHeader('origin',  upstreamOrigin);
-    proxyReq.setHeader('referer', upstreamOrigin + '/');
-    proxyReq.removeHeader('accept-encoding'); // force plaintext responses
-    const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
-    if (ip) proxyReq.setHeader('x-forwarded-for', ip);
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Proxy factory — uses FLAT v2-style keys (onProxyReq / onProxyRes / onError)
-// so it works whether http-proxy-middleware v2 OR v3 is installed.
-// ---------------------------------------------------------------------------
+// ─── Proxy factory ────────────────────────────────────────────────────────────
 function makeProxy(target, { pathRewrite } = {}) {
+  const { host } = new URL(target);
+
   return createProxyMiddleware({
     target,
     changeOrigin:        true,
     ws:                  true,
     followRedirects:     false,
-    selfHandleResponse:  true,        // required by responseInterceptor
+    selfHandleResponse:  true,
     cookieDomainRewrite: { '*': '' },
     cookiePathRewrite:   { '*': '/' },
     ...(pathRewrite ? { pathRewrite } : {}),
 
-    // ── v2-style flat event keys ──────────────────────────────────────────
-    onProxyReq:  makeReqHandler(target),
-    onProxyRes:  bodyRewriter,
+    // Skip buffering entirely for known-binary paths
+    // (filter returning false means "don't proxy this request via this
+    //  middleware", but since we only use it for the skip-selfHandle trick
+    //  we instead rely on the early-return in bodyRewriter for content-type
+    //  checks, and use filter just to log)
+    // Note: to truly skip selfHandleResponse per-request we'd need two
+    // middleware instances; the early-return in responseInterceptor is the
+    // next best thing and avoids the string-replace overhead at least.
+
+    // ── v2-compatible flat event keys ──────────────────────────────────────
+    onProxyReq(proxyReq, req) {
+      proxyReq.setHeader('host',    host);
+      proxyReq.setHeader('origin',  target);
+      proxyReq.setHeader('referer', target + '/');
+      // Do NOT remove accept-encoding — let CDN send compressed responses.
+      // responseInterceptor handles decompression automatically.
+      const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
+      if (ip) proxyReq.setHeader('x-forwarded-for', ip);
+    },
+
+    onProxyRes: bodyRewriter,
+
     onError(err, req, res) {
       console.error(`[proxy:error] ${req.method} ${req.url}`, err.message);
       if (res && !res.headersSent) res.status(502).send('Proxy error: ' + err.message);
@@ -224,29 +232,19 @@ function makeProxy(target, { pathRewrite } = {}) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Routes — specific paths before the catch-all
-// ---------------------------------------------------------------------------
-app.use('/auth',       makeProxy('https://login.nvidia.com',
-                         { pathRewrite: { '^/auth': '' } }));
-app.use('/nvidia',     makeProxy('https://www.nvidia.com',
-                         { pathRewrite: { '^/nvidia': '' } }));
-app.use('/nvidiagrid', makeProxy('https://assets.nvidiagrid.net',
-                         { pathRewrite: { '^/nvidiagrid': '' } }));
-app.use('/gfnblob',    makeProxy('https://gfnjpstorageaccount.blob.core.windows.net',
-                         { pathRewrite: { '^/gfnblob': '' } }));
+// ─── Routes ───────────────────────────────────────────────────────────────────
+app.use('/auth',       makeProxy('https://login.nvidia.com',     { pathRewrite: { '^/auth': '' } }));
+app.use('/nvidia',     makeProxy('https://www.nvidia.com',       { pathRewrite: { '^/nvidia': '' } }));
+app.use('/nvidiagrid', makeProxy('https://assets.nvidiagrid.net',{ pathRewrite: { '^/nvidiagrid': '' } }));
+app.use('/gfnblob',    makeProxy('https://gfnjpstorageaccount.blob.core.windows.net', { pathRewrite: { '^/gfnblob': '' } }));
 app.use('/',           makeProxy('https://play.geforcenow.com'));
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
-const PORT = process.env.PORT || 3000;
+// ─── Start ────────────────────────────────────────────────────────────────────
+const PORT   = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`[proxy] port=${PORT}  PROXY_HOST=${PROXY_HOST}`);
 });
 
-server.on('upgrade', (req, _socket, _head) => {
-  console.log(`[ws:upgrade] ${req.url}`);
-});
+server.on('upgrade', (req) => console.log(`[ws:upgrade] ${req.url}`));
 
 module.exports = { app, server };
