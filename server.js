@@ -4,20 +4,25 @@
  * High-performance GeForce Now streaming proxy
  *
  * Architecture:
- *   HTTP  → raw http/https with keepAlive agents  (no http-proxy-middleware)
+ *   HTTP  → raw https with keepAlive agents (no http-proxy-middleware)
  *   HTML  → streaming Transform (SRI strip + SW inject + domain rewrite, no buffer)
  *   JS/CSS→ streaming Transform (domain rewrite, overlap buffer)
- *   Binary→ straight pipe, zero copy
- *   Cache → in-memory LRU (256 MB) for immutable static assets
- *   WS    → raw TLS splice, no middleware
+ *   Binary→ straight pipe, zero copy; immutable assets cached in 256 MB LRU
+ *   WS    → raw TLS splice via data events (no pipe deadlocks)
  *
- * Why the old version showed a blank tab:
- *   1. clear-site-data header nuked all browser caches on every HTML response,
- *      forcing a full cold-load every time (no cached JS, CSS, fonts, images)
- *   2. HTML was fully buffered before byte 1 reached the browser
- *   3. No keepAlive: every asset paid a full TLS handshake (~150-250 ms)
- *   4. compression() re-gzipped content we had just decompressed (wasted CPU)
- *   5. http-proxy-middleware added unnecessary event-emitter chain overhead
+ * Fixes vs previous version:
+ *   [LOADING HANG #1] 304 / 204 / 1xx / HEAD have no body — old code sent them
+ *     into the decompress+rewrite pipeline which waited forever for data
+ *   [LOADING HANG #2] WebSocket bidirectional pipe() creates backpressure
+ *     deadlocks under load — replaced with data-event splice
+ *   [LOADING HANG #3] No upstream timeout — one hung API call during the JS
+ *     startup sequence stalls the entire loading screen indefinitely
+ *   [LOADING HANG #4] pipeline(req, upReq) + upReq.on('error') both fired on
+ *     failure, causing double-response / destroyed-socket writes
+ *   [BLANK TAB]  clear-site-data on every HTML response wiped all browser
+ *     caches, making every load a full cold start
+ *   [BLANK TAB]  HTML fully buffered — now streamed chunk-by-chunk
+ *   [LATENCY]    No keepAlive — each asset paid a full TLS handshake
  */
 
 const http    = require('http');
@@ -31,13 +36,13 @@ const { Transform, pipeline } = require('stream');
 const PORT       = Number(process.env.PORT || 3000);
 const PROXY_HOST = (process.env.PROXY_HOST || `http://localhost:${PORT}`).replace(/\/$/, '');
 
-// Route table: evaluated in order, first prefix match wins
+// Evaluated in order — first prefix match wins
 const ROUTES = [
-  { prefix: '/auth',       target: 'https://login.nvidia.com'                            },
-  { prefix: '/nvidia',     target: 'https://www.nvidia.com'                              },
-  { prefix: '/nvidiagrid', target: 'https://assets.nvidiagrid.net'                       },
-  { prefix: '/gfnblob',    target: 'https://gfnjpstorageaccount.blob.core.windows.net'   },
-  { prefix: '/',           target: 'https://play.geforcenow.com'                         },
+  { prefix: '/auth',       target: 'https://login.nvidia.com'                          },
+  { prefix: '/nvidia',     target: 'https://www.nvidia.com'                            },
+  { prefix: '/nvidiagrid', target: 'https://assets.nvidiagrid.net'                     },
+  { prefix: '/gfnblob',   target: 'https://gfnjpstorageaccount.blob.core.windows.net' },
+  { prefix: '/',           target: 'https://play.geforcenow.com'                       },
 ];
 
 const DOMAIN_MAP = {
@@ -48,20 +53,19 @@ const DOMAIN_MAP = {
   'https://gfnjpstorageaccount.blob.core.windows.net': `${PROXY_HOST}/gfnblob`,
 };
 
-// ─── keepAlive upstream agents ────────────────────────────────────────────────
-// Reuse TLS sessions across requests. Without this every single asset (JS, CSS,
-// font, image) pays a full TLS handshake (~150-250 ms). With it the connection
-// is already warm and data starts flowing in microseconds.
+const UPSTREAM_TIMEOUT_MS = 20_000; // abort hung upstream requests after 20 s
+
+// ─── keepAlive upstream agent ─────────────────────────────────────────────────
 
 const HTTPS_AGENT = new https.Agent({
   keepAlive:      true,
-  maxSockets:     256,   // concurrent upstream sockets
-  maxFreeSockets: 64,    // idle sockets kept warm between requests
+  maxSockets:     256,
+  maxFreeSockets: 64,
   timeout:        30_000,
-  scheduling:     'lifo', // reuse most-recently-idle socket (warm TLS state)
+  scheduling:     'lifo',
 });
 
-// ─── Domain rewrite (one compiled regex, one pass) ───────────────────────────
+// ─── Domain rewrite ───────────────────────────────────────────────────────────
 
 const DOMAIN_ENTRIES = Object.entries(DOMAIN_MAP);
 const DOMAIN_RE      = new RegExp(
@@ -69,7 +73,6 @@ const DOMAIN_RE      = new RegExp(
   'g'
 );
 const MAX_DOMAIN_LEN = Math.max(...DOMAIN_ENTRIES.map(([k]) => k.length));
-// Fast-path skip: if none of these tokens are present, no domain can appear
 const DOMAIN_HINTS   = ['nvidia', 'geforcenow', 'gfnjpstorageaccount'];
 
 function rewriteDomains(str) {
@@ -82,61 +85,48 @@ function rewriteDomains(str) {
 const REWRITABLE_RE   = /\b(?:text|javascript|json|xml|manifest)\b/i;
 const HTML_RE         = /text\/html/i;
 const STATIC_EXT_RE   = /\.(?:js|mjs|css|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico|wasm|map)(?:[?#]|$)/i;
-const IMMUTABLE_CC_RE = /\bimmutable\b|max-age=([1-9]\d{4,})/; // max-age >= 10 000 s
+const IMMUTABLE_CC_RE = /\bimmutable\b|max-age=([1-9]\d{4,})/;
 
-// ─── In-memory LRU cache (256 MB) ────────────────────────────────────────────
-// Serves immutable static assets (JS bundles, fonts, images) from RAM,
-// eliminating upstream round-trips on repeat visits.
+// HTTP status codes / methods that must never have a response body
+function isBodyless(status, method) {
+  return method === 'HEAD' ||
+    status === 204 || status === 304 ||
+    (status >= 100 && status < 200);
+}
+
+// ─── LRU cache (256 MB) ───────────────────────────────────────────────────────
 
 class LRU {
   constructor(maxBytes) {
-    this.max  = maxBytes;
-    this.used = 0;
-    this.map  = new Map(); // Map preserves insertion order → LRU eviction
+    this.max = maxBytes; this.used = 0; this.map = new Map();
   }
-
-  get(key) {
-    if (!this.map.has(key)) return null;
-    const v = this.map.get(key);
-    this.map.delete(key);
-    this.map.set(key, v); // promote to tail (most-recently-used)
-    return v;
+  get(k) {
+    if (!this.map.has(k)) return null;
+    const v = this.map.get(k); this.map.delete(k); this.map.set(k, v); return v;
   }
-
-  set(key, entry) {
-    const bytes = entry.body.length;
-    if (bytes > this.max >>> 2) return; // skip items > 25 % of total budget
-    while (this.used + bytes > this.max && this.map.size > 0) {
-      const [k, v] = this.map.entries().next().value;
-      this.map.delete(k);
-      this.used -= v.body.length;
+  set(k, v) {
+    const b = v.body.length;
+    if (b > this.max >>> 2) return;
+    while (this.used + b > this.max && this.map.size > 0) {
+      const [ek, ev] = this.map.entries().next().value;
+      this.map.delete(ek); this.used -= ev.body.length;
     }
-    if (this.map.has(key)) this.used -= this.map.get(key).body.length;
-    this.map.set(key, entry);
-    this.used += bytes;
+    if (this.map.has(k)) this.used -= this.map.get(k).body.length;
+    this.map.set(k, v); this.used += b;
   }
 }
 
-const CACHE = new LRU(256 << 20); // 256 MB
+const CACHE = new LRU(256 << 20);
 
-// ─── Header handling ──────────────────────────────────────────────────────────
+// ─── Headers ──────────────────────────────────────────────────────────────────
 
 const DROP_HEADERS = new Set([
-  'x-frame-options',
-  'content-security-policy',
-  'content-security-policy-report-only',
-  'cross-origin-opener-policy',
-  'cross-origin-embedder-policy',
-  'cross-origin-resource-policy',
-  'strict-transport-security',
-  'x-content-type-options',
-  'x-xss-protection',
-  'report-to',
-  'nel',
-  // KEY FIX: never forward clear-site-data.
-  // This header instructs the browser to wipe all caches, cookies, and storage
-  // before the page even renders. Every load became a cold start: no cached JS,
-  // no cached fonts, no cached images — everything re-downloaded from scratch.
+  'x-frame-options', 'content-security-policy', 'content-security-policy-report-only',
+  'cross-origin-opener-policy', 'cross-origin-embedder-policy', 'cross-origin-resource-policy',
+  'strict-transport-security', 'x-content-type-options', 'x-xss-protection',
+  'report-to', 'nel',
+  // Forwarding this header tells the browser to wipe all caches/cookies/storage
+  // before rendering — every load becomes a cold start.
   'clear-site-data',
 ]);
 
@@ -174,11 +164,9 @@ function makeDecompressor(enc) {
 }
 
 // ─── Streaming transforms ─────────────────────────────────────────────────────
-//
-// Overlap buffer: must be >= the longest possible pattern that could straddle
-// a chunk boundary. integrity="sha512-<88-char-base64>" is ~115 chars.
-// MAX_DOMAIN_LEN is ~55. 512 bytes covers both with room to spare.
 
+// Large enough to cover the longest SRI attribute (~115 chars) and longest
+// upstream domain (~55 chars) that could straddle a chunk boundary.
 const OVERLAP = Math.max(MAX_DOMAIN_LEN, 512);
 
 const SRI_RES = [
@@ -187,12 +175,8 @@ const SRI_RES = [
   /(?<![a-zA-Z0-9_-])crossorigin\s*=\s*"[^"]*"/gi,
   /(?<![a-zA-Z0-9_-])crossorigin\s*=\s*'[^']*'/gi,
 ];
-function stripSRI(s) {
-  for (const r of SRI_RES) s = s.replace(r, '');
-  return s;
-}
+function stripSRI(s) { for (const r of SRI_RES) s = s.replace(r, ''); return s; }
 
-// Minified so it adds minimal bytes to every HTML page
 const SW_SNIPPET =
   `<script>/* proxy */(function(){` +
   `if(!('serviceWorker' in navigator))return;` +
@@ -201,70 +185,40 @@ const SW_SNIPPET =
   `caches.keys().then(function(k){k.forEach(function(c){caches.delete(c);});});` +
   `}());</script>`;
 
-/**
- * makeHTMLStream()
- *
- * Processes HTML chunk by chunk — the browser receives the first bytes of the
- * page as soon as the first chunk arrives from upstream, instead of waiting
- * for the entire page to be downloaded and buffered.
- *
- * On a slow connection or a large SPA bootstrap page this is the difference
- * between first paint in ~100 ms vs several seconds of blank tab.
- *
- * Per chunk (in a single pass):
- *   1. Strip integrity/crossorigin attributes (SRI)
- *   2. Inject SW unregister snippet after <head> (once)
- *   3. Rewrite upstream domain URLs to local proxy paths
- */
 function makeHTMLStream() {
-  let tail     = '';
-  let injected = false;
-
+  let tail = '', injected = false;
   return new Transform({
     transform(chunk, _enc, cb) {
-      let s    = tail + chunk.toString('utf8');
-      tail     = s.slice(-OVERLAP);
+      let s = tail + chunk.toString('utf8');
+      tail  = s.slice(-OVERLAP);
       let safe = s.slice(0, s.length - OVERLAP);
       if (!safe) return cb();
-
       safe = stripSRI(safe);
-
       if (!injected) {
-        safe = safe.replace(/(<head[^>]*>)/i, (_, tag) => {
-          injected = true;
-          return tag + SW_SNIPPET;
-        });
+        safe = safe.replace(/(<head[^>]*>)/i, (_, tag) => { injected = true; return tag + SW_SNIPPET; });
       }
-
       cb(null, Buffer.from(rewriteDomains(safe), 'utf8'));
     },
-
     flush(cb) {
       if (!tail) return cb();
       let s = stripSRI(tail);
-      if (!injected) s = SW_SNIPPET + s; // <head> never appeared, prepend
+      if (!injected) s = SW_SNIPPET + s;
       cb(null, Buffer.from(rewriteDomains(s), 'utf8'));
     },
   });
 }
 
-/**
- * makeRewriteStream()
- * Streaming domain rewrite for JS / CSS / JSON.
- */
 function makeRewriteStream() {
   let tail = '';
-
   return new Transform({
     transform(chunk, _enc, cb) {
-      const s    = tail + chunk.toString('utf8');
-      tail       = s.slice(-OVERLAP);
+      const s = tail + chunk.toString('utf8');
+      tail    = s.slice(-OVERLAP);
       const safe = s.slice(0, s.length - OVERLAP);
       if (!safe) return cb();
       const out = rewriteDomains(safe);
       cb(null, out === safe ? Buffer.from(safe) : Buffer.from(out, 'utf8'));
     },
-
     flush(cb) {
       if (!tail) return cb();
       const out = rewriteDomains(tail);
@@ -279,8 +233,7 @@ function resolveRoute(reqUrl) {
   for (const r of ROUTES) {
     const p = r.prefix;
     if (p === '/' || reqUrl === p || reqUrl.startsWith(p + '/') || reqUrl.startsWith(p + '?')) {
-      const strippedPath = p === '/' ? reqUrl : (reqUrl.slice(p.length) || '/');
-      return { target: r.target, path: strippedPath };
+      return { target: r.target, path: p === '/' ? reqUrl : (reqUrl.slice(p.length) || '/') };
     }
   }
   return { target: ROUTES[ROUTES.length - 1].target, path: reqUrl };
@@ -289,14 +242,14 @@ function resolveRoute(reqUrl) {
 // ─── HTTP request handler ─────────────────────────────────────────────────────
 
 function handleRequest(req, res) {
-  if (res.socket) res.socket.setNoDelay(true); // disable Nagle — flush immediately
+  if (res.socket) res.socket.setNoDelay(true);
 
-  // Service-worker stub file
+  // Service-worker stub
   if (/gfn-service-worker\.js/.test(req.url)) {
     res.writeHead(200, {
-      'content-type':           'application/javascript; charset=utf-8',
+      'content-type': 'application/javascript; charset=utf-8',
       'service-worker-allowed': '/',
-      'cache-control':          'no-store',
+      'cache-control': 'no-store',
     });
     return res.end(SW_STUB_FILE);
   }
@@ -305,24 +258,29 @@ function handleRequest(req, res) {
   const upUrl    = new URL(path, target);
   const cacheKey = upUrl.href;
 
-  // Cache lookup (GET only)
   if (req.method === 'GET') {
     const hit = CACHE.get(cacheKey);
-    if (hit) {
-      res.writeHead(200, hit.headers);
-      res.end(hit.body);
-      return;
-    }
+    if (hit) { res.writeHead(200, hit.headers); res.end(hit.body); return; }
   }
 
-  // Build upstream headers
+  // Build upstream headers — forward everything except hop-by-hop
   const upHeaders = { origin: target, referer: target + '/' };
   for (const [k, v] of Object.entries(req.headers)) {
     const kl = k.toLowerCase();
     if (!HOP_BY_HOP.has(kl)) upHeaders[kl] = v;
   }
-  upHeaders['host']            = upUrl.hostname;
-  upHeaders['accept-encoding'] = 'gzip, deflate'; // skip brotli, slower to decompress
+  upHeaders['host'] = upUrl.hostname;
+
+  let responded = false;
+  function safeError(msg) {
+    if (responded) return;
+    responded = true;
+    console.error('[proxy]', req.method, req.url, msg);
+    try {
+      if (!res.headersSent) res.writeHead(502);
+      if (!res.writableEnded) res.end('Proxy error: ' + msg);
+    } catch (_) {}
+  }
 
   const upReq = https.request(
     {
@@ -334,24 +292,36 @@ function handleRequest(req, res) {
       agent:    HTTPS_AGENT,
     },
     upRes => {
-      const headers  = sanitizeResHeaders(upRes.headers);
-      const status   = upRes.statusCode;
-      const ct       = headers['content-type'] || '';
-      const encoding = upRes.headers['content-encoding'];
+      responded = true;
+      const headers = sanitizeResHeaders(upRes.headers);
+      const status  = upRes.statusCode;
+      const ct      = headers['content-type'] || '';
+      const enc     = upRes.headers['content-encoding'];
 
-      // ── Binary ─────────────────────────────────────────────────────────
+      // ── Bodyless responses (304, 204, 1xx, HEAD) ───────────────────────
+      // CRITICAL FIX: these statuses have no body. Sending them into a
+      // decompress/rewrite pipeline causes it to wait forever for data
+      // that never arrives, hanging the browser's request indefinitely.
+      if (isBodyless(status, req.method)) {
+        // 304 must preserve the exact headers that tell the browser its
+        // cached copy is still valid — do not strip content-encoding here
+        res.writeHead(status, headers);
+        res.end();
+        upRes.resume(); // drain so the socket can be reused
+        return;
+      }
+
+      // ── Binary (images, fonts, wasm, video) ────────────────────────────
       if (!REWRITABLE_RE.test(ct)) {
         const shouldCache =
-          req.method === 'GET' &&
-          status === 200 &&
+          req.method === 'GET' && status === 200 &&
           STATIC_EXT_RE.test(req.url) &&
           IMMUTABLE_CC_RE.test(headers['cache-control'] || '');
 
         if (shouldCache) {
-          // Decompress so we store raw bytes (client may not support gzip)
-          const decomp = makeDecompressor(encoding);
-          const src    = decomp ? upRes.pipe(decomp) : upRes;
-          const chunks = [];
+          const decomp  = makeDecompressor(enc);
+          const src     = decomp ? upRes.pipe(decomp) : upRes;
+          const chunks  = [];
           src.on('data', c => chunks.push(c));
           src.on('end', () => {
             const body = Buffer.concat(chunks);
@@ -366,17 +336,16 @@ function handleRequest(req, res) {
           return;
         }
 
-        // Non-cacheable binary: pipe with encoding headers intact (zero work)
         res.writeHead(status, headers);
         pipeline(upRes, res, _err => {});
         return;
       }
 
-      // Text responses: decompress, strip encoding headers (length will change)
+      // Text: decompress ourselves, remove encoding headers
       delete headers['content-encoding'];
       delete headers['content-length'];
 
-      const decomp = makeDecompressor(encoding);
+      const decomp = makeDecompressor(enc);
 
       // ── HTML ───────────────────────────────────────────────────────────
       if (HTML_RE.test(ct)) {
@@ -397,25 +366,34 @@ function handleRequest(req, res) {
     }
   );
 
-  upReq.on('error', err => {
-    console.error('[proxy] upstream error:', req.method, req.url, err.message);
-    if (!res.headersSent) res.writeHead(502);
-    if (!res.writableEnded) res.end('Proxy error: ' + err.message);
+  // Timeout: if upstream doesn't respond within N seconds, unblock the browser.
+  // Without this, one stalled API call during GFN's startup sequence causes
+  // the loading screen to hang until the browser's own timeout fires (~2 min).
+  upReq.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    upReq.destroy(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`));
   });
 
-  pipeline(req, upReq, err => {
-    if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE') {
-      console.error('[proxy] req body pipe:', err.message);
-    }
-  });
+  upReq.on('error', err => safeError(err.message));
+
+  // Pipe request body using events instead of pipeline() to avoid a conflict
+  // where both pipeline's internal error handler and upReq.on('error') would
+  // attempt to handle the same failure and write to an already-closed response.
+  req.on('data',  chunk => { if (!upReq.destroyed) upReq.write(chunk); });
+  req.on('end',   ()    => { if (!upReq.destroyed) upReq.end(); });
+  req.on('error', err   => { console.error('[proxy] client req error:', err.message); upReq.destroy(); });
 }
 
 // ─── WebSocket / Upgrade handler ──────────────────────────────────────────────
 //
-// GeForce Now streams the game over WebSocket. Rather than routing through
-// middleware (which buffers frames and adds event-emitter overhead), we open a
-// raw TLS socket to the upstream host and splice the two streams together.
-// The browser and upstream talk directly through our process with zero parsing.
+// GFN uses WebSocket for game session signalling. We open a raw TLS socket to
+// upstream and splice the byte streams together.
+//
+// WHY data events instead of pipe():
+//   Bidirectional pipe() — upSocket.pipe(clientSocket) + clientSocket.pipe(upSocket)
+//   — can deadlock under backpressure. If both sides fill their write buffers
+//   simultaneously and neither drains, both pipes stall. With data events we
+//   write directly and ignore backpressure (acceptable for a proxy that just
+//   needs to forward WebSocket frames without buffering them).
 
 function handleUpgrade(req, clientSocket, head) {
   clientSocket.setNoDelay(true);
@@ -427,8 +405,14 @@ function handleUpgrade(req, clientSocket, head) {
   const upSocket = tls.connect(
     { host: upUrl.hostname, port: upPort, servername: upUrl.hostname },
     () => {
-      const fwdHeaders = Object.entries(req.headers)
-        .filter(([k]) => !HOP_BY_HOP.has(k.toLowerCase()) && k.toLowerCase() !== 'host')
+      upSocket.setNoDelay(true);
+
+      // Replay the HTTP Upgrade handshake to upstream
+      const fwdLines = Object.entries(req.headers)
+        .filter(([k]) => {
+          const kl = k.toLowerCase();
+          return !HOP_BY_HOP.has(kl) && kl !== 'host';
+        })
         .map(([k, v]) => `${k}: ${v}`)
         .join('\r\n');
 
@@ -436,7 +420,7 @@ function handleUpgrade(req, clientSocket, head) {
         `GET ${upUrl.pathname}${upUrl.search} HTTP/1.1\r\n` +
         `host: ${upUrl.hostname}\r\n` +
         `origin: ${target}\r\n` +
-        (fwdHeaders ? fwdHeaders + '\r\n' : '') +
+        (fwdLines ? fwdLines + '\r\n' : '') +
         'connection: Upgrade\r\n' +
         'upgrade: websocket\r\n' +
         '\r\n'
@@ -444,17 +428,23 @@ function handleUpgrade(req, clientSocket, head) {
 
       if (head && head.length) upSocket.write(head);
 
-      // Bidirectional splice — no parsing, no buffering
-      upSocket.pipe(clientSocket);
-      clientSocket.pipe(upSocket);
+      // Bidirectional splice via data events — no pipe(), no deadlocks
+      upSocket.on('data', chunk => { if (!clientSocket.destroyed) clientSocket.write(chunk); });
+      clientSocket.on('data', chunk => { if (!upSocket.destroyed) upSocket.write(chunk); });
     }
   );
 
-  const cleanup = () => { upSocket.destroy(); clientSocket.destroy(); };
-  upSocket.on('error', err => { console.error('[ws]', err.message); cleanup(); });
-  clientSocket.on('error', cleanup);
-  clientSocket.on('close', () => upSocket.destroy());
-  upSocket.on('close', () => clientSocket.destroy());
+  const cleanup = () => {
+    if (!upSocket.destroyed)    upSocket.destroy();
+    if (!clientSocket.destroyed) clientSocket.destroy();
+  };
+
+  upSocket.on('end',   () => { if (!clientSocket.destroyed) clientSocket.end(); });
+  clientSocket.on('end', () => { if (!upSocket.destroyed) upSocket.end(); });
+  upSocket.on('error',   err => { console.error('[ws] upstream:', err.message); cleanup(); });
+  clientSocket.on('error', () => cleanup());
+  upSocket.on('close',   () => { if (!clientSocket.destroyed) clientSocket.destroy(); });
+  clientSocket.on('close', () => { if (!upSocket.destroyed) upSocket.destroy(); });
 }
 
 // ─── Service-worker file ──────────────────────────────────────────────────────
@@ -473,8 +463,6 @@ const SW_STUB_FILE = [
 
 const server = http.createServer(handleRequest);
 server.on('upgrade', handleUpgrade);
-
-// Keep game sessions alive — don't time out long-lived connections
 server.keepAliveTimeout = 120_000;
 server.headersTimeout   = 125_000;
 
